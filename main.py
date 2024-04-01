@@ -1,3 +1,5 @@
+import pdb
+
 from mistral.cache import RotatingBufferCache
 import logging
 import torch
@@ -7,6 +9,9 @@ from pathlib import Path
 
 from mistral.model import Transformer
 from mistral.tokenizer import Tokenizer
+
+import time
+from eetq.utils import eet_quantize
 
 
 def sample_top_p(probs: torch.Tensor, p: float):
@@ -32,7 +37,8 @@ def sample(logits: torch.Tensor, temperature: float, top_p: float):
 
 
 @torch.inference_mode()
-def generate(prompts: List[str], model: Transformer, tokenizer: Tokenizer, *, max_tokens: int,  temperature: float, chunk_size: int = None):
+def generate(prompts: List[str], model: Transformer, tokenizer: Tokenizer, *, max_tokens: int, temperature: float,
+             chunk_size: int = None):
     model = model.eval()
     B, V = len(prompts), model.args.vocab_size
 
@@ -53,7 +59,7 @@ def generate(prompts: List[str], model: Transformer, tokenizer: Tokenizer, *, ma
     )
     cache.to(device=model.device, dtype=model.dtype)
     cache.reset()
-    
+
     # Bookkeeping
     logprobs = [[] for _ in range(B)]
     last_token_prelogits = None
@@ -65,13 +71,15 @@ def generate(prompts: List[str], model: Transformer, tokenizer: Tokenizer, *, ma
 
     # Encode prompt by chunks
     for s in range(0, max_prompt_len, chunk_size):
-        prompt_chunks = [p[s:s+chunk_size] for p in encoded_prompts]
+        prompt_chunks = [p[s:s + chunk_size] for p in encoded_prompts]
         assert all(len(p) > 0 for p in prompt_chunks)
+        start_time = time.time()
         prelogits = model.forward(
             torch.tensor(sum(prompt_chunks, []), device=model.device, dtype=torch.long),
             seqlens=[len(p) for p in prompt_chunks],
             cache=cache
         )
+        print("Time To First Token (TTFT): ", time.time() - start_time)
         logits = torch.log_softmax(prelogits, dim=-1)
 
         if last_token_prelogits is not None:
@@ -85,11 +93,13 @@ def generate(prompts: List[str], model: Transformer, tokenizer: Tokenizer, *, ma
             logprobs[i_seq].extend([logits[offset + i, sequence[i + 1]].item() for i in range(len(sequence) - 1)])
             offset += len(sequence)
 
-        last_token_prelogits = prelogits.index_select(0, torch.tensor([len(p) for p in prompt_chunks], device=prelogits.device).cumsum(dim=0) - 1)
+        last_token_prelogits = prelogits.index_select(0, torch.tensor([len(p) for p in prompt_chunks],
+                                                                      device=prelogits.device).cumsum(dim=0) - 1)
         assert last_token_prelogits.shape == (B, V)
 
     # decode
     generated_tokens = []
+    time_log = []
     assert last_token_prelogits is not None
     for i_token in range(max_tokens):
         next_token = sample(last_token_prelogits, temperature=temperature, top_p=0.8)
@@ -99,7 +109,9 @@ def generate(prompts: List[str], model: Transformer, tokenizer: Tokenizer, *, ma
             logprobs[i].append(last_token_logits[i, next_token[i]].item())
 
         generated_tokens.append(next_token[:, None])
+        start_time = time.time()
         last_token_prelogits = model.forward(next_token, seqlens=[1] * len(prompts), cache=cache)
+        time_log.append(time.time() - start_time)
         assert last_token_prelogits.shape == (B, V)
 
     generated_words = []
@@ -108,12 +120,18 @@ def generate(prompts: List[str], model: Transformer, tokenizer: Tokenizer, *, ma
         for i, x in enumerate(encoded_prompts):
             generated_words.append(tokenizer.decode(x + generated_tokens[i].tolist()))
 
+    print("Generated tokens number: ", len(generated_tokens))
+    print(f"Time Per Output Token (TPOT): {sum(time_log) / len(time_log)}")
+
     return generated_words, logprobs
 
 
 def interactive(model_path: str, max_tokens: int = 35, temperature: float = 0.7, instruct: bool = False):
     tokenizer = Tokenizer(str(Path(model_path) / "tokenizer.model"))
     transformer = Transformer.from_folder(Path(model_path), max_batch_size=3)
+    pdb.set_trace()
+    # quantize
+    # transformer = eet_quantize(transformer)
 
     while True:
         prompt = input("Prompt: ")
@@ -131,7 +149,7 @@ def interactive(model_path: str, max_tokens: int = 35, temperature: float = 0.7,
 
 
 def demo(
-    model_path: str, max_tokens: int = 35, temperature: float = 0, num_pipeline_ranks=1
+        model_path: str, max_tokens: int = 35, temperature: float = 0, num_pipeline_ranks=1
 ):
     if num_pipeline_ranks > 1:
         torch.distributed.init_process_group()
@@ -143,6 +161,8 @@ def demo(
     transformer = Transformer.from_folder(
         Path(model_path), max_batch_size=3, num_pipeline_ranks=num_pipeline_ranks
     )
+
+    # transformer = eet_quantize(transformer)
 
     res, _logprobs = generate(
         [
@@ -156,10 +176,11 @@ def demo(
         temperature=temperature,
     )
     if should_print:
-        for x,l in zip(res, _logprobs):
+        for x, l in zip(res, _logprobs):
             print(x)
-            logging.debug('Logprobs: %s',l)
+            logging.debug('Logprobs: %s', l)
             print("=====================")
+
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
