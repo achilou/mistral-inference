@@ -14,6 +14,7 @@ from mistral.cache import CacheView, RotatingBufferCache
 from mistral.moe import MoeArgs, MoeLayer
 
 from xformers.ops.fmha import memory_efficient_attention
+from mistral.layers import get_linear
 
 
 @dataclass
@@ -58,7 +59,7 @@ def repeat_kv(keys: torch.Tensor, values: torch.Tensor, repeats: int, dim: int):
 
 
 class Attention(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, weights, id):
         super().__init__()
         self.args = args
 
@@ -68,18 +69,22 @@ class Attention(nn.Module):
 
         self.repeats = self.n_heads // self.n_kv_heads
 
-        self.scale = self.args.head_dim**-0.5
+        self.scale = self.args.head_dim ** -0.5
 
-        self.wq = nn.Linear(args.dim, args.n_heads * args.head_dim, bias=False)
-        self.wk = nn.Linear(args.dim, args.n_kv_heads * args.head_dim, bias=False)
-        self.wv = nn.Linear(args.dim, args.n_kv_heads * args.head_dim, bias=False)
-        self.wo = nn.Linear(args.n_heads * args.head_dim, args.dim, bias=False)
+        # self.wq = nn.Linear(args.dim, args.n_heads * args.head_dim, bias=False)
+        # self.wk = nn.Linear(args.dim, args.n_kv_heads * args.head_dim, bias=False)
+        # self.wv = nn.Linear(args.dim, args.n_kv_heads * args.head_dim, bias=False)
+        # self.wo = nn.Linear(args.n_heads * args.head_dim, args.dim, bias=False)
+        self.wq = get_linear(weights[f'layers.{id}.attention.wq.weight'], quantize='eetq')
+        self.wk = get_linear(weights[f'layers.{id}.attention.wk.weight'], quantize='eetq')
+        self.wv = get_linear(weights[f'layers.{id}.attention.wv.weight'], quantize='eetq')
+        self.wo = get_linear(weights[f'layers.{id}.attention.wo.weight'], quantize='eetq')
 
     def forward(
-        self,
-        x: torch.Tensor,
-        freqs_cis: torch.Tensor,
-        cache: Optional[CacheView],
+            self,
+            x: torch.Tensor,
+            freqs_cis: torch.Tensor,
+            cache: Optional[CacheView],
     ) -> torch.Tensor:
         seqlen_sum, _ = x.shape
 
@@ -117,12 +122,15 @@ class Attention(nn.Module):
 
 
 class FeedForward(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, weights, id):
         super().__init__()
 
-        self.w1 = nn.Linear(args.dim, args.hidden_dim, bias=False)
-        self.w2 = nn.Linear(args.hidden_dim, args.dim, bias=False)
-        self.w3 = nn.Linear(args.dim, args.hidden_dim, bias=False)
+        # self.w1 = nn.Linear(args.dim, args.hidden_dim, bias=False)
+        # self.w2 = nn.Linear(args.hidden_dim, args.dim, bias=False)
+        # self.w3 = nn.Linear(args.dim, args.hidden_dim, bias=False)
+        self.w1 = get_linear(weights[f'layers.{id}.feed_forward.w1.weight'], quantize='eetq')
+        self.w2 = get_linear(weights[f'layers.{id}.feed_forward.w2.weight'], quantize='eetq')
+        self.w3 = get_linear(weights[f'layers.{id}.feed_forward.w3.weight'], quantize='eetq')
 
     def forward(self, x) -> torch.Tensor:
         return self.w2(nn.functional.silu(self.w1(x)) * self.w3(x))
@@ -143,27 +151,31 @@ class RMSNorm(torch.nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, weights, id):
         super().__init__()
         self.n_heads = args.n_heads
         self.dim = args.dim
-        self.attention = Attention(args)
+        self.attention = Attention(args, weights, id)
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
+        self.attention_norm.weight = nn.Parameter(weights[f'layers.{id}.attention_norm.weight'].to(torch.float16), requires_grad=False)
+        self.attention_norm.to('cuda')
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
+        self.ffn_norm.weight = nn.Parameter(weights[f'layers.{id}.ffn_norm.weight'].to(torch.float16), requires_grad=False)
+        self.ffn_norm.to('cuda')
         self.args = args
 
         self.feed_forward: nn.Module
         if args.moe is not None:
             self.feed_forward = MoeLayer(
-                experts=[FeedForward(args=args) for _ in range(args.moe.num_experts)],
+                experts=[FeedForward(args=args, weights=weights, id=id) for _ in range(args.moe.num_experts)],
                 gate=nn.Linear(args.dim, args.moe.num_experts, bias=False),
                 moe_args=args.moe,
             )
         else:
-            self.feed_forward = FeedForward(args=args)
+            self.feed_forward = FeedForward(args=args, weights=weights, id=id)
 
     def forward(
-        self, x: torch.Tensor, freqs_cis: torch.Tensor, cache: Optional[CacheView]
+            self, x: torch.Tensor, freqs_cis: torch.Tensor, cache: Optional[CacheView]
     ) -> torch.Tensor:
         r = self.attention.forward(self.attention_norm(x), freqs_cis, cache)
         h = x + r
@@ -174,10 +186,9 @@ class TransformerBlock(nn.Module):
 
 class Transformer(nn.Module):
     def __init__(
-        self,
-        args: ModelArgs,
-        pipeline_rank: int = 0,
-        num_pipeline_ranks: int = 1,
+            self,
+            args: ModelArgs,
+            weights: dict
     ):
         super().__init__()
         self.args = args
@@ -185,24 +196,29 @@ class Transformer(nn.Module):
         self.n_layers = args.n_layers
         self._precomputed_freqs_cis: Optional[torch.Tensor] = None
         assert self.vocab_size > 0
-        assert pipeline_rank < num_pipeline_ranks, (pipeline_rank, num_pipeline_ranks)
-        self.pipeline_rank = pipeline_rank
-        self.num_pipeline_ranks = num_pipeline_ranks
+        # assert pipeline_rank < num_pipeline_ranks, (pipeline_rank, num_pipeline_ranks)
+        self.pipeline_rank = 0
+        self.num_pipeline_ranks = 1
         # Modules specific to some ranks:
         self.tok_embeddings: Optional[nn.Embedding] = None
         self.norm: Optional[RMSNorm] = None
         self.output: Optional[nn.Linear] = None
-        if pipeline_rank == 0:
-            self.tok_embeddings = nn.Embedding(args.vocab_size, args.dim)
-        if pipeline_rank == num_pipeline_ranks - 1:
-            self.norm = RMSNorm(args.dim, eps=args.norm_eps)
-            self.output = nn.Linear(args.dim, args.vocab_size, bias=False)
+        self.tok_embeddings = nn.Embedding(args.vocab_size, args.dim)
+        self.tok_embeddings.weight = nn.Parameter(weights['tok_embeddings.weight'].to(torch.float16), requires_grad=False)
+        self.tok_embeddings.to('cuda')
+        self.norm = RMSNorm(args.dim, eps=args.norm_eps)
+        self.norm.weight = nn.Parameter(weights['norm.weight'].to(torch.float16), requires_grad=False)
+        self.norm.to('cuda')
+        self.output = get_linear(weights['output.weight'], quantize='eetq')
+        # self.output = nn.Linear(args.dim, args.vocab_size, bias=False)
         # Initialize all layers but slice off those not of this rank.
-        layers = [TransformerBlock(args=args) for _ in range(args.n_layers)]
-        num_layers_per_rank = math.ceil(self.n_layers / self.num_pipeline_ranks)
-        offset = self.pipeline_rank * num_layers_per_rank
-        end = min(self.n_layers, offset + num_layers_per_rank)
-        self.layers = nn.ModuleDict({str(i): layers[i] for i in range(offset, end)})
+        layers = [TransformerBlock(args=args, weights=weights, id=i) for i in range(args.n_layers)]
+        # num_layers_per_rank = math.ceil(self.n_layers / self.num_pipeline_ranks)
+        # offset = self.pipeline_rank * num_layers_per_rank
+        # end = min(self.n_layers, offset + num_layers_per_rank)
+        # self.layers = nn.ModuleDict({str(i): layers[i] for i in range(offset, end)})
+        # self.n_local_layers = len(self.layers)
+        self.layers = nn.ModuleDict({str(i): layers[i] for i in range(args.n_layers)})
         self.n_local_layers = len(self.layers)
 
     @property
@@ -234,10 +250,10 @@ class Transformer(nn.Module):
         return self._precomputed_freqs_cis
 
     def forward_partial(
-        self,
-        input_ids: torch.Tensor,
-        seqlens: List[int],
-        cache: Optional[RotatingBufferCache] = None,
+            self,
+            input_ids: torch.Tensor,
+            seqlens: List[int],
+            cache: Optional[RotatingBufferCache] = None,
     ) -> torch.Tensor:
         """Local forward pass.
 
@@ -245,7 +261,7 @@ class Transformer(nn.Module):
         For the last stage, this will return the normalized final embeddings.
         """
         assert (
-            len(seqlens) <= self.args.max_batch_size
+                len(seqlens) <= self.args.max_batch_size
         ), f"Max batch size is {self.args.max_batch_size}, got batch size of {len(seqlens)}"
         (num_toks,) = input_ids.shape
         assert sum(seqlens) == num_toks, (sum(seqlens), num_toks)
@@ -284,10 +300,10 @@ class Transformer(nn.Module):
             return self.norm(h)
 
     def forward(
-        self,
-        input_ids: torch.Tensor,
-        seqlens: List[int],
-        cache: Optional[RotatingBufferCache] = None,
+            self,
+            input_ids: torch.Tensor,
+            seqlens: List[int],
+            cache: Optional[RotatingBufferCache] = None,
     ) -> torch.Tensor:
         h = self.forward_partial(input_ids, seqlens, cache=cache)
         if self.pipeline_rank < self.num_pipeline_ranks - 1:
@@ -303,67 +319,72 @@ class Transformer(nn.Module):
             torch.distributed.broadcast(outs, src=self.num_pipeline_ranks - 1)
         return outs.float()
 
-    def load_state_dict(self, state_dict, *args, **kwargs):
+    def load_state_dict(self, state_dict: dict, *args, **kwargs):
         state_to_load = {}
         skipped = set([])
-        for k, v in state_dict.items():
-            if k.startswith("tok_embeddings"):
-                if self.pipeline_rank == 0:
-                    state_to_load[k] = v
-                else:
-                    logging.debug(
-                        "Skipping parameter %s at pipeline rank %d",
-                        k,
-                        self.pipeline_rank,
-                    )
-                    skipped.add(k)
-            elif k.startswith("norm") or k.startswith("output"):
-                if self.pipeline_rank == self.num_pipeline_ranks - 1:
-                    state_to_load[k] = v
-                else:
-                    logging.debug(
-                        "Skipping parameter %s at pipeline rank %d",
-                        k,
-                        self.pipeline_rank,
-                    )
-                    skipped.add(k)
-            elif k.startswith("layers"):
-                layer_id = k.split(".")[1]
-                if layer_id in self.layers:
-                    state_to_load[k] = v
-                else:
-                    logging.debug(
-                        "Skipping parameter %s at pipeline rank %d",
-                        k,
-                        self.pipeline_rank,
-                    )
-                    skipped.add(k)
-            else:
-                raise ValueError(f"Unexpected key {k}")
-        assert set(state_dict.keys()) == skipped.union(set(state_to_load.keys()))
+        # for k, v in state_dict.items():
+        #     if k.startswith("tok_embeddings"):
+        #         if self.pipeline_rank == 0:
+        #             state_to_load[k] = v
+        #         else:
+        #             logging.debug(
+        #                 "Skipping parameter %s at pipeline rank %d",
+        #                 k,
+        #                 self.pipeline_rank,
+        #             )
+        #             skipped.add(k)
+        #     elif k.startswith("norm") or k.startswith("output"):
+        #         if self.pipeline_rank == self.num_pipeline_ranks - 1:
+        #             state_to_load[k] = v
+        #         else:
+        #             logging.debug(
+        #                 "Skipping parameter %s at pipeline rank %d",
+        #                 k,
+        #                 self.pipeline_rank,
+        #             )
+        #             skipped.add(k)
+        #     elif k.startswith("layers"):
+        #         layer_id = k.split(".")[1]
+        #         if layer_id in self.layers:
+        #             state_to_load[k] = v
+        #         else:
+        #             logging.debug(
+        #                 "Skipping parameter %s at pipeline rank %d",
+        #                 k,
+        #                 self.pipeline_rank,
+        #             )
+        #             skipped.add(k)
+        #     else:
+        #         raise ValueError(f"Unexpected key {k}")
+        # assert set(state_dict.keys()) == skipped.union(set(state_to_load.keys()))
         super().load_state_dict(state_to_load, *args, **kwargs)
 
     @staticmethod
     def from_folder(
-        folder: Path,
-        max_batch_size: int = 1,
-        num_pipeline_ranks: int = 1,
-        device="cuda",
-        dtype=torch.float16,
+            folder: Path,
+            max_batch_size: int = 1,
+            num_pipeline_ranks: int = 1,
+            device="cuda",
+            dtype=torch.float16,
     ) -> "Transformer":
         with open(folder / "params.json", "r") as f:
             model_args = ModelArgs.from_dict(json.load(f))
         model_args.max_batch_size = max_batch_size
-        if num_pipeline_ranks > 1:
-            pipeline_rank = torch.distributed.get_rank()
-        else:
-            pipeline_rank = 0
-        with torch.device("meta"):
-            model = Transformer(
-                model_args,
-                pipeline_rank=pipeline_rank,
-                num_pipeline_ranks=num_pipeline_ranks,
-            )
+        # if num_pipeline_ranks > 1:
+        #     pipeline_rank = torch.distributed.get_rank()
+        # else:
+        #     pipeline_rank = 0
+        # with torch.device("meta"):
+        #     model = Transformer(
+        #         model_args,
+        #         pipeline_rank=pipeline_rank,
+        #         num_pipeline_ranks=num_pipeline_ranks,
+        #     )
         loaded = torch.load(str(folder / "consolidated.00.pth"), mmap=True)
-        model.load_state_dict(loaded, assign=True)
-        return model.to(device=device, dtype=dtype)
+        # weights = {key: loaded[key].to(torch.float32) for key in loaded}
+        # model.load_state_dict(loaded, assign=True)
+        model = Transformer(
+            model_args,
+            weights=loaded
+        )
+        return model
