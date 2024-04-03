@@ -120,7 +120,7 @@ def generate(prompts: List[str], model: Transformer, tokenizer: Tokenizer, *, ma
         for i, x in enumerate(encoded_prompts):
             generated_words.append(tokenizer.decode(x + generated_tokens[i].tolist()))
 
-    print("Generated tokens number: ", len(generated_tokens))
+    print("Generated batch size: ", len(generated_tokens))
     print(f"Time Per Output Token (TPOT): {sum(time_log) / len(time_log)}")
 
     return generated_words, logprobs
